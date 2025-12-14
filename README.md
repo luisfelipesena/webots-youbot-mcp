@@ -1,25 +1,32 @@
 # Webots MCP Server
 
-Generic MCP (Model Context Protocol) server for monitoring and controlling **any** Webots robot simulation. Provides Claude Code with real-time access to robot state, sensors, camera, and simulation control.
+Generic MCP (Model Context Protocol) bridge for **any** Webots robot simulation. Provides Claude Code and Cursor with real-time access to robot state, sensors, camera, and simulation control.
 
-## Features
+## Quick Start (3 Lines)
 
-- **Real-time Monitoring**: Robot pose, mode, custom state fields
-- **Sensor Data**: Any sensors your controller publishes
-- **Camera**: View camera frames saved by controller
-- **Simulation Control**: Pause, resume, reset, reload, step
-- **Logging**: Controller logs with filtering
-- **Screenshots**: Capture simulation views
+```python
+from mcp_bridge import MCPBridge
 
-## Quick Start
+bridge = MCPBridge(robot)  # Auto-detects Supervisor
+bridge.publish({"pose": [x, y, theta], "mode": "navigate"})
+```
 
-### 1. Install
+That's it! Claude Code now has full visibility into your simulation.
+
+## Installation
+
+### Option 1: Clone (Recommended)
 
 ```bash
+git clone https://github.com/luisfelipesena/webots-youbot-mcp.git
 pip install mcp pydantic
 ```
 
-### 2. Configure Claude Code
+### Option 2: Copy Files
+
+Copy `mcp_bridge.py` to your controller directory.
+
+## Claude Code Integration
 
 Add to your project's `.mcp.json`:
 
@@ -35,31 +42,61 @@ Add to your project's `.mcp.json`:
 }
 ```
 
-### 3. Add to Your Controller
+## Cursor Integration
 
-Minimal integration (~10 lines):
+Same configuration - Cursor reads `.mcp.json` automatically.
+
+## Controller Integration
+
+### Minimal Example
 
 ```python
 import sys
 sys.path.insert(0, "/path/to/webots-youbot-mcp")
 from mcp_bridge import MCPBridge
 
-# In __init__:
-self.mcp = MCPBridge(self.robot)  # pass Robot or Supervisor
+class MyController:
+    def __init__(self):
+        self.robot = Robot()  # or Supervisor()
+        self.mcp = MCPBridge(self.robot)
 
-# In main loop:
-self.mcp.publish({
-    "pose": [x, y, theta],
-    "mode": "navigate",
-    "sensors": {"front": 0.5, "left": 1.2},
-    # ... any fields you want to expose
-})
-self.mcp.get_command()  # handles simulation control
+    def run(self):
+        while self.robot.step(32) != -1:
+            # Your logic here
+            self.mcp.publish({
+                "pose": [x, y, theta],
+                "mode": self.mode,
+                "sensors": {"front": 1.2, "left": 0.8},
+            })
+            self.mcp.get_command()  # Handle simulation control
 ```
 
-That's it! The bridge handles throttling, file I/O, and command processing.
+### Advanced: World Reload Detection
 
-## Available Tools
+```python
+def reset_state():
+    """Called automatically when world reloads"""
+    self.mode = "search"
+    self.collected = 0
+
+bridge = MCPBridge(robot)
+bridge.on_reload(reset_state)
+
+# In main loop:
+bridge.detect_reload()  # Triggers callback if reload detected
+```
+
+### Advanced: Custom Commands
+
+```python
+def handle_custom(cmd):
+    if cmd.get("action") == "my_action":
+        print(f"Custom command: {cmd}")
+
+bridge.register_command("my_action", handle_custom)
+```
+
+## Available MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -67,34 +104,27 @@ That's it! The bridge handles throttling, file I/O, and command processing.
 | `webots_get_sensors` | Get sensor data from status |
 | `webots_get_camera` | Get latest camera frame path |
 | `webots_get_logs` | Get controller logs |
-| `webots_simulation_control` | Pause/resume/reset/reload/step |
+| `webots_simulation_control` | Pause/resume/reset/reload/step/fast |
+| `webots_world_reload` | Force reload world (macOS: osascript) |
+| `webots_world_reset` | Reset simulation to initial state |
+| `webots_reset_controller_state` | Reset controller internal state |
 | `webots_take_screenshot` | Capture simulation view |
 | `webots_monitor` | Monitor robot for N seconds |
 | `webots_get_full_state` | Complete state dump |
 
-## MCPBridge API
+### Force Reload (macOS)
+
+When controller is stuck, use force reload via osascript:
 
 ```python
-bridge = MCPBridge(robot, data_dir=None)
-
-# Publish state (call every timestep)
-bridge.publish({"key": "value", ...})
-
-# Check for commands (optional)
-cmd = bridge.get_command()
-
-# Log messages
-bridge.log("message")
-
-# Save camera frames (optional)
-bridge.save_camera_frame(camera)
+# From MCP:
+webots_world_reload(force=True)  # Sends Ctrl+Shift+R to Webots
+webots_world_reset(force=True)   # Sends Ctrl+Shift+T to Webots
 ```
 
-Built-in commands handled automatically:
-- `simulation`: pause/resume/reset/reload/step
-- `screenshot`: capture simulation view
+Requires accessibility permissions for Terminal/IDE in System Preferences.
 
-## Data Directory
+## Data Directory Structure
 
 ```
 data/
@@ -103,6 +133,44 @@ data/
 ├── camera/          # Camera frames
 ├── screenshots/     # Simulation screenshots
 └── logs/            # Controller logs
+```
+
+## MCPBridge API Reference
+
+```python
+bridge = MCPBridge(robot, data_dir=None, throttle_interval=5)
+
+# Core
+bridge.publish(state_dict)          # Publish state (throttled)
+bridge.publish(state, force=True)   # Publish immediately
+bridge.get_command()                # Check for MCP commands
+
+# Reload Detection
+bridge.on_reload(callback)          # Register reload callback
+bridge.detect_reload()              # Check if world reloaded
+
+# Custom Commands
+bridge.register_command(action, handler)
+
+# Utilities
+bridge.log(message)                 # Write to log file
+bridge.save_camera_frame(camera)    # Save camera image
+```
+
+## Global Installation (All Projects)
+
+Add to `~/.config/claude/mcp.json` (Claude Code) or global Cursor settings:
+
+```json
+{
+  "mcpServers": {
+    "webots": {
+      "command": "python",
+      "args": ["/absolute/path/to/webots_youbot_mcp_server.py"],
+      "cwd": "/absolute/path/to/webots-youbot-mcp"
+    }
+  }
+}
 ```
 
 ## Requirements

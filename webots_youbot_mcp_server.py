@@ -9,6 +9,8 @@ Works with any robot type and sensor configuration.
 """
 
 import json
+import subprocess
+import platform
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from enum import Enum
@@ -71,6 +73,15 @@ class SimulationCommandInput(BaseModel):
         ...,
         description="Command: 'pause', 'resume', 'reset', 'reload', 'step'",
         pattern="^(pause|resume|reset|reload|step)$"
+    )
+
+
+class WorldReloadInput(BaseModel):
+    """Input for world reload command."""
+    model_config = ConfigDict(extra='forbid')
+    force: bool = Field(
+        default=False,
+        description="Force reload using OS-level keyboard shortcut (macOS only). Use when controller is not responding."
     )
 
 
@@ -399,6 +410,176 @@ async def webots_simulation_control(params: SimulationCommandInput) -> str:
     if _write_command(cmd):
         return f"✓ Command `{params.command}` sent to simulation."
     return f"✗ Failed to send `{params.command}` command."
+
+
+def _send_webots_keystroke(keystroke: str, modifiers: List[str] = None) -> tuple[bool, str]:
+    """
+    Send keystroke to Webots application using osascript (macOS only).
+
+    Args:
+        keystroke: The key to press
+        modifiers: List of modifiers ('command', 'control', 'shift', 'option')
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if platform.system() != "Darwin":
+        return False, "OS-level keystroke only supported on macOS"
+
+    modifiers = modifiers or []
+    modifier_str = ", ".join(modifiers) if modifiers else ""
+
+    if modifier_str:
+        applescript = f'''
+        tell application "Webots"
+            activate
+        end tell
+        delay 0.3
+        tell application "System Events"
+            keystroke "{keystroke}" using {{{modifier_str} down}}
+        end tell
+        '''
+    else:
+        applescript = f'''
+        tell application "Webots"
+            activate
+        end tell
+        delay 0.3
+        tell application "System Events"
+            keystroke "{keystroke}"
+        end tell
+        '''
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", applescript],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            return True, "Keystroke sent successfully"
+        else:
+            return False, f"osascript error: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return False, "osascript timed out"
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+
+@mcp.tool(
+    name="webots_reset_controller_state",
+    annotations={
+        "title": "Reset Controller State",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def webots_reset_controller_state(params: EmptyInput) -> str:
+    """
+    Reset the robot controller's internal state without reloading the world.
+
+    Resets collected count, delivered cubes, and mode to search.
+    Useful when world was reloaded but controller kept its state.
+
+    Returns:
+        Status message
+    """
+    import asyncio
+
+    cmd = {"action": "reset_state"}
+    if _write_command(cmd):
+        await asyncio.sleep(1)
+        return "✓ Controller state reset command sent. Robot should restart in search mode."
+    return "✗ Failed to write reset command."
+
+
+@mcp.tool(
+    name="webots_world_reload",
+    annotations={
+        "title": "Reload World",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def webots_world_reload(params: WorldReloadInput) -> str:
+    """
+    Reload the Webots world to restart the simulation.
+
+    Two modes:
+    - Default: Sends reload command via commands.json (requires running controller)
+    - Force (macOS): Uses osascript to send Ctrl+Shift+R keystroke directly to Webots
+
+    Args:
+        params: Reload options
+
+    Returns:
+        Status message
+    """
+    import asyncio
+
+    if params.force:
+        # Use osascript to send Ctrl+Shift+R (World Reload shortcut)
+        success, msg = _send_webots_keystroke("r", ["control", "shift"])
+        if success:
+            # Wait for reload to complete
+            await asyncio.sleep(3)
+            return "✓ World reload triggered via keystroke (Ctrl+Shift+R). Simulation should restart."
+        else:
+            return f"✗ Force reload failed: {msg}"
+    else:
+        # Standard method via commands.json
+        cmd = {"action": "simulation", "command": "reload"}
+        if _write_command(cmd):
+            await asyncio.sleep(1)
+            return "✓ Reload command sent. If controller is running, world will reload."
+        return "✗ Failed to write reload command."
+
+
+@mcp.tool(
+    name="webots_world_reset",
+    annotations={
+        "title": "Reset Simulation",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def webots_world_reset(params: WorldReloadInput) -> str:
+    """
+    Reset the simulation to initial state (keeps world loaded).
+
+    Two modes:
+    - Default: Sends reset command via commands.json
+    - Force (macOS): Uses osascript to send Ctrl+Shift+T keystroke
+
+    Args:
+        params: Reset options
+
+    Returns:
+        Status message
+    """
+    import asyncio
+
+    if params.force:
+        # Use osascript to send Ctrl+Shift+T (Simulation Reset shortcut)
+        success, msg = _send_webots_keystroke("t", ["control", "shift"])
+        if success:
+            await asyncio.sleep(2)
+            return "✓ Simulation reset triggered via keystroke (Ctrl+Shift+T)."
+        else:
+            return f"✗ Force reset failed: {msg}"
+    else:
+        cmd = {"action": "simulation", "command": "reset"}
+        if _write_command(cmd):
+            await asyncio.sleep(1)
+            return "✓ Reset command sent."
+        return "✗ Failed to write reset command."
 
 
 @mcp.tool(

@@ -1,82 +1,110 @@
 """
 MCP Bridge for Webots Controllers.
 
-A lightweight, generic bridge between ANY Webots controller and the MCP server.
-Minimal API - just call publish() with your state dict.
+Generic, minimal bridge between ANY Webots controller and Claude Code via MCP.
+Requires only 3 lines of code in your controller.
 
 Usage:
     from mcp_bridge import MCPBridge
 
-    bridge = MCPBridge(robot)
+    bridge = MCPBridge(robot)  # Auto-detects Supervisor
+    bridge.publish({"pose": [x, y, theta], "mode": "navigate"})
 
-    # In main loop - just pass a dict with whatever state you want to expose:
-    bridge.publish({
-        "pose": [x, y, theta],
-        "mode": "search",
-        "collected": 5,
-        # ... any other fields
-    })
-
-    # Optionally check for commands:
-    cmd = bridge.get_command()
-    if cmd:
-        handle_command(cmd)
+Advanced:
+    bridge.on_reload(reset_callback)  # Auto-detect world reloads
+    bridge.register_command("custom_action", handler_fn)
 """
 
 import json
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Any, Optional
-
-
-# Default data directory (sibling to this file)
-DEFAULT_DATA_DIR = Path(__file__).parent / "data"
+from typing import Dict, Any, Optional, Callable, List
 
 
 class MCPBridge:
     """Minimal bridge between Webots controller and MCP server."""
 
-    def __init__(self, robot, data_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        robot,
+        data_dir: Optional[Path] = None,
+        throttle_interval: int = 5,
+    ):
         """
         Initialize MCP bridge.
 
         Args:
-            robot: Webots Robot/Supervisor instance
-            data_dir: Path to data directory (default: ./data)
+            robot: Webots Robot or Supervisor instance
+            data_dir: Path to data directory (default: auto-detect)
+            throttle_interval: Publish every N calls (reduces I/O)
         """
         self.robot = robot
         self._is_supervisor = hasattr(robot, 'simulationSetMode')
-        self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
 
-        # Ensure directories exist
+        # Auto-detect data directory
+        if data_dir:
+            self.data_dir = Path(data_dir)
+        else:
+            # Try common locations
+            candidates = [
+                Path(__file__).parent / "data",
+                Path.cwd() / "mcp_data",
+                Path.home() / ".webots-mcp" / "data",
+            ]
+            self.data_dir = next((p for p in candidates if p.exists()), candidates[0])
+
+        # Lazy initialization flag
+        self._initialized = False
+
+        # Throttling
+        self._update_counter = 0
+        self._throttle_interval = throttle_interval
+
+        # Command handlers
+        self._command_handlers: Dict[str, Callable] = {}
+        self._last_cmd_ts = None
+
+        # Reload detection
+        self._sim_time = 0.0
+        self._reload_callback: Optional[Callable] = None
+
+        # Files (set on first use)
+        self.status_file: Optional[Path] = None
+        self.commands_file: Optional[Path] = None
+        self.log_file: Optional[Path] = None
+
+    def _ensure_dirs(self):
+        """Create directories on first use (lazy init)."""
+        if self._initialized:
+            return
+
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "camera").mkdir(exist_ok=True)
         (self.data_dir / "screenshots").mkdir(exist_ok=True)
         (self.data_dir / "logs").mkdir(exist_ok=True)
 
-        # Files
         self.status_file = self.data_dir / "status.json"
         self.commands_file = self.data_dir / "commands.json"
         self.log_file = self.data_dir / "logs" / "controller.log"
 
-        # State
-        self._last_cmd_ts = None
-        self._update_counter = 0
-        self._update_interval = 5  # Write every N calls to reduce I/O
+        self._initialized = True
 
-    def publish(self, state: Dict[str, Any]):
+    def publish(self, state: Dict[str, Any], force: bool = False):
         """
         Publish robot state to MCP server.
 
-        Call this every timestep with your current state.
-        The bridge handles throttling automatically.
+        Call every timestep with your current state dict.
+        Throttled automatically to reduce I/O.
 
         Args:
             state: Dict with any fields (pose, mode, sensors, etc.)
+            force: Bypass throttling and publish immediately
         """
         self._update_counter += 1
-        if self._update_counter % self._update_interval != 0:
+        if not force and self._update_counter % self._throttle_interval != 0:
             return
+
+        self._ensure_dirs()
 
         # Add timestamp
         state["timestamp"] = datetime.now().isoformat()
@@ -92,9 +120,11 @@ class MCPBridge:
         Check for commands from MCP server.
 
         Returns:
-            Command dict if new command available, None otherwise.
-            Handles the command internally if it's a simulation control.
+            Command dict if new command, None otherwise.
+            Built-in commands (simulation, screenshot) handled automatically.
         """
+        self._ensure_dirs()
+
         if not self.commands_file.exists():
             return None
 
@@ -116,12 +146,56 @@ class MCPBridge:
             self._handle_simulation_cmd(cmd)
         elif action == "screenshot":
             self._handle_screenshot_cmd(cmd)
+        elif action in self._command_handlers:
+            self._command_handlers[action](cmd)
 
         return cmd
+
+    def register_command(self, action: str, handler: Callable[[Dict], None]):
+        """
+        Register custom command handler.
+
+        Args:
+            action: Command action name (e.g., "custom_reset")
+            handler: Function(cmd_dict) to handle command
+        """
+        self._command_handlers[action] = handler
+
+    def on_reload(self, callback: Callable[[], None]):
+        """
+        Register callback for world reload detection.
+
+        Args:
+            callback: Function() called when world reload is detected
+        """
+        self._reload_callback = callback
+
+    def detect_reload(self) -> bool:
+        """
+        Detect if world was reloaded (simulation time jumped backwards).
+
+        Returns:
+            True if reload detected
+        """
+        try:
+            current = self.robot.getTime()
+        except Exception:
+            return False
+
+        if current < self._sim_time - 0.1:  # Small tolerance
+            if self._reload_callback:
+                self.log("World reload detected - calling reset callback")
+                self._reload_callback()
+            self._sim_time = 0.0
+            return True
+
+        self._sim_time = current
+        return False
 
     def _handle_simulation_cmd(self, cmd: Dict[str, Any]):
         """Handle simulation control commands."""
         if not self._is_supervisor:
+            self.log("Warning: simulation control requires Supervisor")
             return
 
         command = cmd.get("command")
@@ -130,6 +204,8 @@ class MCPBridge:
                 self.robot.simulationSetMode(self.robot.SIMULATION_MODE_PAUSE)
             elif command == "resume":
                 self.robot.simulationSetMode(self.robot.SIMULATION_MODE_REAL_TIME)
+            elif command == "fast":
+                self.robot.simulationSetMode(self.robot.SIMULATION_MODE_FAST)
             elif command == "reset":
                 self.robot.simulationReset()
             elif command == "reload":
@@ -156,6 +232,7 @@ class MCPBridge:
 
     def log(self, message: str):
         """Append message to log file."""
+        self._ensure_dirs()
         ts = datetime.now().strftime("%H:%M:%S")
         try:
             with open(self.log_file, 'a') as f:
@@ -169,8 +246,9 @@ class MCPBridge:
 
         Args:
             camera: Webots Camera device
-            max_frames: Max frames to keep
+            max_frames: Max frames to keep (rolling)
         """
+        self._ensure_dirs()
         try:
             image = camera.getImage()
             if not image:
@@ -180,7 +258,6 @@ class MCPBridge:
             w, h = camera.getWidth(), camera.getHeight()
             img = Image.frombytes('RGBA', (w, h), image).convert('RGB')
 
-            # Rolling filename
             frame_num = self._update_counter % max_frames
             path = self.data_dir / "camera" / f"frame_{frame_num:04d}.png"
             img.save(path)
@@ -188,3 +265,31 @@ class MCPBridge:
             pass  # PIL not available
         except Exception:
             pass
+
+    # === Convenience Methods ===
+
+    def auto_publish(
+        self,
+        extra: Optional[Dict] = None,
+        include_time: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Auto-extract and publish common robot data.
+
+        Args:
+            extra: Additional fields to merge
+            include_time: Include simulation time
+
+        Returns:
+            Published state dict
+        """
+        state = extra or {}
+
+        if include_time:
+            try:
+                state["sim_time"] = self.robot.getTime()
+            except Exception:
+                pass
+
+        self.publish(state)
+        return state
