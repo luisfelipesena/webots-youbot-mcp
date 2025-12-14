@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
-MCP Server for Webots YouBot Simulation.
+MCP Server for Webots Simulation Monitoring.
 
-Provides tools for Claude Code to monitor and analyze the YouBot robot
-in a Webots simulation, including sensor data, camera images, screenshots,
-task progress, and simulation control.
+A generic MCP server that provides Claude Code with real-time access to
+ANY Webots simulation - automatically detects robots, sensors, and world structure.
+
+Works with any robot type and sensor configuration.
 """
 
 import json
-import os
-import base64
-import glob
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, Dict, Any, List
 from enum import Enum
 from datetime import datetime
 
@@ -20,20 +18,20 @@ from pydantic import BaseModel, Field, ConfigDict
 from mcp.server.fastmcp import FastMCP
 
 # Initialize MCP server
-mcp = FastMCP("webots_youbot_mcp")
+mcp = FastMCP("webots_mcp")
 
 # Constants
 CHARACTER_LIMIT = 25000
 DATA_DIR = Path(__file__).parent / "data"
 STATUS_FILE = DATA_DIR / "status.json"
 COMMANDS_FILE = DATA_DIR / "commands.json"
+WORLD_INFO_FILE = DATA_DIR / "world_info.json"
 CAMERA_DIR = DATA_DIR / "camera"
 SCREENSHOTS_DIR = DATA_DIR / "screenshots"
 LOGS_DIR = DATA_DIR / "logs"
-GRID_DIR = DATA_DIR / "grid"
 
 # Ensure directories exist
-for d in [DATA_DIR, CAMERA_DIR, SCREENSHOTS_DIR, LOGS_DIR, GRID_DIR]:
+for d in [DATA_DIR, CAMERA_DIR, SCREENSHOTS_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -66,37 +64,37 @@ class LogsInput(BaseModel):
     filter_text: Optional[str] = Field(default=None, description="Filter logs containing this text")
 
 
-class ScreenshotInput(BaseModel):
-    """Input for screenshot operations."""
-    model_config = ConfigDict(extra='forbid')
-    save_path: Optional[str] = Field(default=None, description="Custom filename (without extension)")
-
-
 class SimulationCommandInput(BaseModel):
     """Input for simulation control commands."""
     model_config = ConfigDict(extra='forbid')
     command: str = Field(
         ...,
-        description="Command: 'pause', 'resume', 'reset', 'step'",
-        pattern="^(pause|resume|reset|step)$"
+        description="Command: 'pause', 'resume', 'reset', 'reload', 'step'",
+        pattern="^(pause|resume|reset|reload|step)$"
     )
+
+
+class MonitorInput(BaseModel):
+    """Input for monitoring commands."""
+    model_config = ConfigDict(extra='forbid')
+    duration: int = Field(default=20, description="Duration in seconds to monitor", ge=1, le=120)
 
 
 # ============== Helper Functions ==============
 
-def _load_status() -> Dict[str, Any]:
-    """Load current robot status from JSON file."""
-    if not STATUS_FILE.exists():
-        return {"error": "No status file found. Is the simulation running?"}
+def _load_json(filepath: Path) -> Dict[str, Any]:
+    """Load JSON file safely."""
+    if not filepath.exists():
+        return {"error": f"File not found: {filepath.name}"}
     try:
-        with open(STATUS_FILE, 'r') as f:
+        with open(filepath, 'r') as f:
             return json.load(f)
     except json.JSONDecodeError:
-        return {"error": "Status file is corrupted or being written"}
+        return {"error": f"Invalid JSON in {filepath.name}"}
 
 
 def _write_command(cmd: Dict[str, Any]) -> bool:
-    """Write command to commands.json for the controller to process."""
+    """Write command to commands.json."""
     try:
         cmd["timestamp"] = datetime.now().isoformat()
         with open(COMMANDS_FILE, 'w') as f:
@@ -106,222 +104,231 @@ def _write_command(cmd: Dict[str, Any]) -> bool:
         return False
 
 
-def _format_pose(pose: List[float]) -> str:
-    """Format pose as readable string."""
-    if not pose or len(pose) < 3:
-        return "Unknown"
-    import math
-    x, y, yaw = pose[0], pose[1], pose[2]
-    yaw_deg = math.degrees(yaw)
-    return f"({x:.2f}, {y:.2f}) θ={yaw_deg:.1f}°"
-
-
-def _get_latest_image(directory: Path, pattern: str = "*.png") -> Optional[Path]:
-    """Get the most recent image from a directory."""
-    files = list(directory.glob(pattern))
-    if not files:
-        return None
-    return max(files, key=lambda p: p.stat().st_mtime)
+def _format_number(val: Any, decimals: int = 2) -> str:
+    """Format number or return as-is."""
+    if isinstance(val, (int, float)):
+        return f"{val:.{decimals}f}"
+    return str(val)
 
 
 # ============== Tools ==============
 
 @mcp.tool(
-    name="webots_get_robot_status",
+    name="webots_get_world_info",
     annotations={
-        "title": "Get Robot Status",
+        "title": "Get World Info",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False
     }
 )
-async def webots_get_robot_status(params: ResponseFormatInput) -> str:
+async def webots_get_world_info(params: ResponseFormatInput) -> str:
     """
-    Get current YouBot robot status including position, mode, and task progress.
+    Get information about the current Webots world.
 
-    Returns robot pose (x, y, θ), current operating mode (search/approach/pick/deliver),
-    number of cubes collected, current target, and timing information.
-
-    Args:
-        params: Response format options
+    Returns world name, all robots detected, their sensors, and scene structure.
+    This is auto-detected from the simulation - works with any world file.
 
     Returns:
-        Robot status in requested format (markdown or JSON)
-
-    Example:
-        - Use when: "Where is the robot now?"
-        - Use when: "What is the robot doing?"
-        - Use when: "How many cubes collected?"
+        World structure with robots and sensors
     """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
+    data = _load_json(WORLD_INFO_FILE)
+    if "error" in data:
+        return f"Error: {data['error']}. Run the MCP Supervisor controller in Webots first."
 
     if params.response_format == ResponseFormat.JSON:
-        return json.dumps(status, indent=2)
+        return json.dumps(data, indent=2)
 
-    # Markdown format
-    lines = ["# YouBot Status", ""]
+    lines = ["# World Information", ""]
+    lines.append(f"**World**: `{data.get('world_name', 'Unknown')}`")
+    lines.append(f"**Time Step**: {data.get('time_step', 'N/A')}ms")
+    lines.append("")
 
-    # Pose
-    pose = status.get("pose", [])
-    lines.append(f"**Position**: {_format_pose(pose)}")
+    robots = data.get("robots", [])
+    if robots:
+        lines.append(f"## Robots ({len(robots)})")
+        for robot in robots:
+            lines.append(f"\n### {robot.get('name', 'Unknown')}")
+            lines.append(f"- **DEF**: `{robot.get('def_name', 'N/A')}`")
+            lines.append(f"- **Type**: {robot.get('type', 'Robot')}")
 
-    # Mode
-    mode = status.get("mode", "unknown")
-    lines.append(f"**Mode**: `{mode}`")
+            sensors = robot.get("sensors", {})
+            if sensors:
+                lines.append("- **Sensors**:")
+                for sensor_type, sensor_list in sensors.items():
+                    lines.append(f"  - {sensor_type}: {len(sensor_list)} ({', '.join(sensor_list[:5])}{'...' if len(sensor_list) > 5 else ''})")
 
-    # Task progress
-    collected = status.get("collected", 0)
-    max_cubes = status.get("max_cubes", 15)
-    lines.append(f"**Cubes Collected**: {collected}/{max_cubes}")
+    return "\n".join(lines)
 
-    # Current target
-    target = status.get("current_target")
-    if target:
-        lines.append(f"**Current Target**: {target}")
 
-    # Delivery stats
-    delivered = status.get("delivered", {})
-    if delivered:
-        lines.append("")
-        lines.append("## Delivery Stats")
-        for color, count in delivered.items():
-            lines.append(f"- **{color.upper()}**: {count}")
+@mcp.tool(
+    name="webots_get_robot_state",
+    annotations={
+        "title": "Get Robot State",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def webots_get_robot_state(params: ResponseFormatInput) -> str:
+    """
+    Get current state of all robots in the simulation.
+
+    Returns position, orientation, velocity, and custom state data
+    published by each robot's controller.
+
+    Returns:
+        Robot states in requested format
+    """
+    data = _load_json(STATUS_FILE)
+    if "error" in data:
+        return f"Error: {data['error']}. Is the simulation running?"
+
+    if params.response_format == ResponseFormat.JSON:
+        return json.dumps(data, indent=2)
+
+    lines = ["# Robot State", ""]
 
     # Timestamp
-    ts = status.get("timestamp")
+    ts = data.get("timestamp")
     if ts:
-        lines.append("")
         lines.append(f"*Updated: {ts}*")
+        lines.append("")
+
+    # Robot-specific data
+    robots = data.get("robots", {})
+    if not robots:
+        # Fallback: single robot format
+        robots = {"main": data}
+
+    for robot_name, state in robots.items():
+        lines.append(f"## {robot_name}")
+
+        # Position
+        pose = state.get("pose", state.get("position", []))
+        if pose:
+            if len(pose) >= 3:
+                import math
+                lines.append(f"**Position**: ({pose[0]:.2f}, {pose[1]:.2f}) θ={math.degrees(pose[2]):.1f}°")
+            elif len(pose) >= 2:
+                lines.append(f"**Position**: ({pose[0]:.2f}, {pose[1]:.2f})")
+
+        # Mode/State
+        mode = state.get("mode", state.get("state"))
+        if mode:
+            lines.append(f"**Mode**: `{mode}`")
+
+        # Custom fields
+        for key, val in state.items():
+            if key not in ("pose", "position", "mode", "state", "timestamp", "sensors", "robots"):
+                if isinstance(val, dict):
+                    lines.append(f"**{key}**: {json.dumps(val)}")
+                elif isinstance(val, list):
+                    lines.append(f"**{key}**: {len(val)} items")
+                else:
+                    lines.append(f"**{key}**: {val}")
+
+        lines.append("")
 
     return "\n".join(lines)
 
 
 @mcp.tool(
-    name="webots_get_lidar_readings",
+    name="webots_get_sensors",
     annotations={
-        "title": "Get LIDAR Readings",
+        "title": "Get Sensor Data",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False
     }
 )
-async def webots_get_lidar_readings(params: ResponseFormatInput) -> str:
+async def webots_get_sensors(params: ResponseFormatInput) -> str:
     """
-    Get all LIDAR sensor readings from the YouBot's 4 LIDAR sensors.
+    Get all sensor readings from the simulation.
 
-    The YouBot has 4 LIDARs: front (180°), rear (180°), left (180°), right (180°).
-    Returns minimum distances detected in each direction and obstacle warnings.
-
-    Args:
-        params: Response format options
+    Automatically detects and returns data from all sensors:
+    LIDAR, Camera, DistanceSensor, GPS, Compass, etc.
 
     Returns:
-        LIDAR data with minimum distances per direction
-
-    Example:
-        - Use when: "Is there something in front of the robot?"
-        - Use when: "What obstacles are nearby?"
+        All sensor data organized by type
     """
-    status = _load_status()
+    data = _load_json(STATUS_FILE)
+    if "error" in data:
+        return f"Error: {data['error']}"
 
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    lidar = status.get("lidar", {})
-    if not lidar:
-        return "No LIDAR data available"
-
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps(lidar, indent=2)
-
-    # Markdown format
-    lines = ["# LIDAR Readings", ""]
-
-    min_distances = lidar.get("min_distances", {})
-
-    # Direction indicators
-    directions = {
-        "front": "⬆️ FRONT",
-        "rear": "⬇️ REAR",
-        "left": "⬅️ LEFT",
-        "right": "➡️ RIGHT"
-    }
-
-    for key, label in directions.items():
-        dist = min_distances.get(key, float('inf'))
-        if dist < 0.3:
-            status_icon = "🔴 DANGER"
-        elif dist < 0.6:
-            status_icon = "🟡 WARNING"
-        else:
-            status_icon = "🟢 CLEAR"
-        lines.append(f"**{label}**: {dist:.2f}m {status_icon}")
-
-    # Obstacle count
-    obstacle_count = lidar.get("obstacle_count", 0)
-    lines.append("")
-    lines.append(f"**Total obstacles detected**: {obstacle_count}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_distance_sensors",
-    annotations={
-        "title": "Get Distance Sensors",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_distance_sensors(params: ResponseFormatInput) -> str:
-    """
-    Get readings from all 8 infrared distance sensors on the YouBot.
-
-    Sensors: ds_front, ds_rear, ds_left, ds_right, ds_front_left,
-    ds_front_right, ds_rear_left, ds_rear_right
-
-    Args:
-        params: Response format options
-
-    Returns:
-        All distance sensor readings with collision warnings
-    """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    sensors = status.get("distance_sensors", {})
+    sensors = data.get("sensors", {})
     if not sensors:
-        return "No distance sensor data available"
+        # Try alternative keys
+        sensors = {}
+        if "lidar_data" in data:
+            sensors["lidar"] = data["lidar_data"]
+        if "distance_sensors" in data:
+            sensors["distance"] = data["distance_sensors"]
+        if "recognized_objects" in data:
+            sensors["camera"] = {"recognized_objects": data["recognized_objects"]}
+
+    if not sensors:
+        return "No sensor data available. Ensure the controller is publishing sensor data."
 
     if params.response_format == ResponseFormat.JSON:
         return json.dumps(sensors, indent=2)
 
-    lines = ["# Distance Sensors (IR)", ""]
+    lines = ["# Sensor Readings", ""]
 
-    for name, value in sorted(sensors.items()):
-        # Convert raw value to approximate distance (lookup table dependent)
-        if value < 50:
-            status_icon = "🔴"
-        elif value < 200:
-            status_icon = "🟡"
-        else:
-            status_icon = "🟢"
-        lines.append(f"- **{name}**: {value:.0f} {status_icon}")
+    # LIDAR
+    lidar = sensors.get("lidar", {})
+    if lidar:
+        lines.append("## LIDAR")
+        for name, readings in lidar.items():
+            if isinstance(readings, dict):
+                min_dist = readings.get("min", readings.get("front", "N/A"))
+                lines.append(f"- **{name}**: min={_format_number(min_dist)}m")
+            else:
+                lines.append(f"- **{name}**: {_format_number(readings)}m")
+        lines.append("")
+
+    # Distance Sensors
+    distance = sensors.get("distance", sensors.get("distance_sensors", {}))
+    if distance:
+        lines.append("## Distance Sensors")
+        for name, val in distance.items():
+            if isinstance(val, (int, float)):
+                icon = "🔴" if val < 100 else "🟡" if val < 300 else "🟢"
+                lines.append(f"- **{name}**: {_format_number(val, 0)} {icon}")
+        lines.append("")
+
+    # Camera/Recognition
+    camera = sensors.get("camera", {})
+    if camera:
+        lines.append("## Camera")
+        objects = camera.get("recognized_objects", [])
+        if objects:
+            lines.append(f"Detected {len(objects)} objects:")
+            for obj in objects[:10]:
+                color = obj.get("color", "unknown")
+                dist = obj.get("distance", 0)
+                lines.append(f"- {color}: {_format_number(dist)}m")
+        lines.append("")
+
+    # Other sensors
+    for sensor_type, sensor_data in sensors.items():
+        if sensor_type not in ("lidar", "distance", "distance_sensors", "camera"):
+            lines.append(f"## {sensor_type.title()}")
+            if isinstance(sensor_data, dict):
+                for k, v in sensor_data.items():
+                    lines.append(f"- **{k}**: {v}")
+            else:
+                lines.append(f"- {sensor_data}")
+            lines.append("")
 
     return "\n".join(lines)
 
 
 @mcp.tool(
-    name="webots_get_camera_image",
+    name="webots_get_camera",
     annotations={
         "title": "Get Camera Image",
         "readOnlyHint": True,
@@ -330,386 +337,34 @@ async def webots_get_distance_sensors(params: ResponseFormatInput) -> str:
         "openWorldHint": False
     }
 )
-async def webots_get_camera_image(params: EmptyInput) -> str:
+async def webots_get_camera(params: EmptyInput) -> str:
     """
-    Get the latest camera image captured by the YouBot.
+    Get the latest camera image from the simulation.
 
-    Returns the path to the most recent camera frame saved by the controller.
-    The camera is 128x128 RGB with object recognition enabled.
+    Returns path to the most recent frame captured by any camera.
 
     Returns:
-        Path to the latest camera image file
-
-    Example:
-        - Use when: "Show me what the robot sees"
-        - Use when: "What's in front of the camera?"
+        Path to camera image file
     """
-    latest = _get_latest_image(CAMERA_DIR)
+    frames = sorted(CAMERA_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
 
-    if not latest:
-        return "No camera images available. Ensure the simulation is running and saving frames."
+    if not frames:
+        return "No camera images available. Ensure camera capture is enabled."
 
-    # Return file info
-    stat = latest.stat()
-    age_seconds = (datetime.now().timestamp() - stat.st_mtime)
+    latest = frames[0]
+    age = datetime.now().timestamp() - latest.stat().st_mtime
 
     lines = [
-        "# Latest Camera Frame",
+        "# Camera Frame",
         "",
         f"**File**: `{latest.name}`",
         f"**Path**: `{latest}`",
-        f"**Age**: {age_seconds:.1f} seconds ago",
-        f"**Size**: {stat.st_size} bytes",
+        f"**Age**: {age:.1f}s",
         "",
-        "Use the Read tool to view this image."
+        "Use Read tool to view this image."
     ]
 
     return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_recognized_objects",
-    annotations={
-        "title": "Get Recognized Objects",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_recognized_objects(params: ResponseFormatInput) -> str:
-    """
-    Get list of objects detected by the camera's recognition system.
-
-    Returns colored cubes detected with their relative position (distance, angle)
-    and color classification.
-
-    Args:
-        params: Response format options
-
-    Returns:
-        List of recognized objects with position and color
-
-    Example:
-        - Use when: "Does the robot see any cubes?"
-        - Use when: "What colors are detected?"
-    """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    objects = status.get("recognized_objects", [])
-
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps({"objects": objects, "count": len(objects)}, indent=2)
-
-    if not objects:
-        return "No objects currently recognized by camera."
-
-    lines = ["# Recognized Objects", "", f"**Total**: {len(objects)} objects", ""]
-
-    for i, obj in enumerate(objects, 1):
-        color = obj.get("color", "unknown")
-        distance = obj.get("distance", 0)
-        angle = obj.get("angle", 0)
-
-        color_emoji = {"red": "🔴", "green": "🟢", "blue": "🔵"}.get(color, "⚪")
-        lines.append(f"{i}. {color_emoji} **{color.upper()}** - {distance:.2f}m @ {angle:.1f}°")
-
-    return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_occupancy_grid",
-    annotations={
-        "title": "Get Occupancy Grid",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_occupancy_grid(params: EmptyInput) -> str:
-    """
-    Get the robot's internal occupancy grid map as ASCII visualization.
-
-    Shows the mapped environment with obstacles, free space, and robot position.
-    Legend: # = obstacle, . = free, ? = unknown, R = robot, G/B/R = boxes
-
-    Returns:
-        ASCII representation of the occupancy grid
-
-    Example:
-        - Use when: "Show me the map"
-        - Use when: "What has the robot explored?"
-    """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    grid_ascii = status.get("grid_ascii")
-
-    if not grid_ascii:
-        # Try loading from file
-        grid_file = GRID_DIR / "grid.txt"
-        if grid_file.exists():
-            grid_ascii = grid_file.read_text()
-        else:
-            return "No occupancy grid data available."
-
-    lines = [
-        "# Occupancy Grid",
-        "",
-        "```",
-        grid_ascii,
-        "```",
-        "",
-        "**Legend**: `#`=obstacle, `.`=free, `?`=unknown, `R`=robot, `G`/`B`/`D`=deposit boxes"
-    ]
-
-    return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_current_path",
-    annotations={
-        "title": "Get Current Path",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_current_path(params: ResponseFormatInput) -> str:
-    """
-    Get the robot's current planned navigation path (waypoints).
-
-    Shows the sequence of waypoints the robot is following to reach its goal.
-
-    Args:
-        params: Response format options
-
-    Returns:
-        List of waypoints with current progress
-    """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    waypoints = status.get("waypoints", [])
-    current_wp = status.get("current_waypoint_index", 0)
-    goal = status.get("active_goal")
-
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps({
-            "waypoints": waypoints,
-            "current_index": current_wp,
-            "goal": goal,
-            "total": len(waypoints)
-        }, indent=2)
-
-    lines = ["# Navigation Path", ""]
-
-    if goal:
-        lines.append(f"**Goal**: ({goal[0]:.2f}, {goal[1]:.2f})")
-
-    if not waypoints:
-        lines.append("No active path - robot may be searching or idle.")
-        return "\n".join(lines)
-
-    lines.append(f"**Waypoints**: {len(waypoints)}")
-    lines.append(f"**Progress**: {current_wp + 1}/{len(waypoints)}")
-    lines.append("")
-
-    for i, wp in enumerate(waypoints[:10]):  # Limit to 10 waypoints
-        marker = "→" if i == current_wp else " "
-        lines.append(f"{marker} {i+1}. ({wp[0]:.2f}, {wp[1]:.2f})")
-
-    if len(waypoints) > 10:
-        lines.append(f"  ... and {len(waypoints) - 10} more")
-
-    return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_task_progress",
-    annotations={
-        "title": "Get Task Progress",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_task_progress(params: ResponseFormatInput) -> str:
-    """
-    Get detailed progress on the cube collection task.
-
-    Shows total cubes collected, cubes delivered by color, and completion percentage.
-    The task is to collect 15 cubes and sort them into colored boxes.
-
-    Args:
-        params: Response format options
-
-    Returns:
-        Detailed task progress report
-
-    Example:
-        - Use when: "How is the task going?"
-        - Use when: "Did the robot finish?"
-    """
-    status = _load_status()
-
-    if "error" in status:
-        return f"Error: {status['error']}"
-
-    collected = status.get("collected", 0)
-    max_cubes = status.get("max_cubes", 15)
-    delivered = status.get("delivered", {"red": 0, "green": 0, "blue": 0})
-    mode = status.get("mode", "unknown")
-
-    total_delivered = sum(delivered.values())
-    completion = (total_delivered / max_cubes) * 100
-
-    data = {
-        "collected": collected,
-        "max_cubes": max_cubes,
-        "delivered": delivered,
-        "total_delivered": total_delivered,
-        "completion_percent": completion,
-        "mode": mode,
-        "is_complete": total_delivered >= max_cubes
-    }
-
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps(data, indent=2)
-
-    lines = [
-        "# Task Progress",
-        "",
-        f"## Completion: {completion:.1f}%",
-        "",
-        f"**Cubes Collected**: {collected}",
-        f"**Cubes Delivered**: {total_delivered}/{max_cubes}",
-        "",
-        "## By Color:",
-        f"- 🔴 **RED**: {delivered.get('red', 0)}",
-        f"- 🟢 **GREEN**: {delivered.get('green', 0)}",
-        f"- 🔵 **BLUE**: {delivered.get('blue', 0)}",
-        "",
-        f"**Current Mode**: `{mode}`"
-    ]
-
-    if total_delivered >= max_cubes:
-        lines.append("")
-        lines.append("## ✅ TASK COMPLETE!")
-
-    return "\n".join(lines)
-
-
-@mcp.tool(
-    name="webots_get_logs",
-    annotations={
-        "title": "Get Controller Logs",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def webots_get_logs(params: LogsInput) -> str:
-    """
-    Get recent log output from the YouBot controller.
-
-    Retrieves the last N lines from the controller's log file, with optional
-    text filtering to find specific events.
-
-    Args:
-        params: Number of lines and optional filter text
-
-    Returns:
-        Recent log entries
-
-    Example:
-        - Use when: "Show me the robot's logs"
-        - Use when: "What errors occurred?"
-    """
-    log_file = LOGS_DIR / "controller.log"
-
-    if not log_file.exists():
-        return "No log file found. Ensure the controller is saving logs."
-
-    try:
-        with open(log_file, 'r') as f:
-            all_lines = f.readlines()
-    except Exception as e:
-        return f"Error reading logs: {e}"
-
-    # Filter if requested
-    if params.filter_text:
-        all_lines = [l for l in all_lines if params.filter_text.lower() in l.lower()]
-
-    # Get last N lines
-    lines = all_lines[-params.lines:]
-
-    if not lines:
-        return "No matching log entries found."
-
-    result = ["# Controller Logs", ""]
-    if params.filter_text:
-        result.append(f"*Filtered by: '{params.filter_text}'*")
-        result.append("")
-    result.append(f"*Showing last {len(lines)} entries*")
-    result.append("")
-    result.append("```")
-    result.extend([l.rstrip() for l in lines])
-    result.append("```")
-
-    return "\n".join(result)
-
-
-@mcp.tool(
-    name="webots_take_screenshot",
-    annotations={
-        "title": "Take Simulation Screenshot",
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False
-    }
-)
-async def webots_take_screenshot(params: ScreenshotInput) -> str:
-    """
-    Request a screenshot of the Webots simulation window.
-
-    Sends a command to the controller to capture the current simulation view.
-    The screenshot is saved to the screenshots directory.
-
-    Args:
-        params: Optional custom filename
-
-    Returns:
-        Path to the saved screenshot
-
-    Example:
-        - Use when: "Take a screenshot of the simulation"
-        - Use when: "Capture the current view"
-    """
-    filename = params.save_path or f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-    cmd = {
-        "action": "screenshot",
-        "filename": filename
-    }
-
-    if _write_command(cmd):
-        expected_path = SCREENSHOTS_DIR / f"{filename}.png"
-        return f"Screenshot requested. Will be saved to: `{expected_path}`\n\nWait a few seconds then use the Read tool to view it."
-    else:
-        return "Error: Failed to send screenshot command."
 
 
 @mcp.tool(
@@ -724,83 +379,194 @@ async def webots_take_screenshot(params: ScreenshotInput) -> str:
 )
 async def webots_simulation_control(params: SimulationCommandInput) -> str:
     """
-    Control the Webots simulation state.
+    Control the Webots simulation.
 
-    Available commands:
-    - pause: Pause the simulation
-    - resume: Resume simulation (real-time mode)
-    - reset: Reset the world to initial state
-    - step: Execute a single simulation step
+    Commands:
+    - pause: Pause simulation
+    - resume: Resume in real-time mode
+    - reset: Reset to initial state
+    - reload: Reload world file
+    - step: Single simulation step
 
     Args:
-        params: The command to execute
+        params: Command to execute
 
     Returns:
-        Confirmation of command sent
+        Confirmation message
     """
-    cmd = {
-        "action": "simulation_control",
-        "command": params.command
-    }
+    cmd = {"action": "simulation", "command": params.command}
 
     if _write_command(cmd):
-        return f"Command `{params.command}` sent to simulation."
-    else:
-        return f"Error: Failed to send {params.command} command."
+        return f"✓ Command `{params.command}` sent to simulation."
+    return f"✗ Failed to send `{params.command}` command."
 
 
 @mcp.tool(
-    name="webots_get_arm_state",
+    name="webots_take_screenshot",
     annotations={
-        "title": "Get Arm State",
+        "title": "Take Screenshot",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def webots_take_screenshot(params: EmptyInput) -> str:
+    """
+    Take a screenshot of the Webots simulation window.
+
+    Returns:
+        Path where screenshot will be saved
+    """
+    filename = f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    cmd = {"action": "screenshot", "filename": filename}
+
+    if _write_command(cmd):
+        path = SCREENSHOTS_DIR / f"{filename}.png"
+        return f"✓ Screenshot requested.\n\n**Path**: `{path}`\n\nWait 2-3 seconds, then use Read tool to view."
+    return "✗ Failed to request screenshot."
+
+
+@mcp.tool(
+    name="webots_get_logs",
+    annotations={
+        "title": "Get Logs",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False
     }
 )
-async def webots_get_arm_state(params: ResponseFormatInput) -> str:
+async def webots_get_logs(params: LogsInput) -> str:
     """
-    Get the current state of the YouBot's robotic arm and gripper.
-
-    Shows arm joint positions and gripper state (open/closed).
+    Get controller log output.
 
     Args:
-        params: Response format options
+        params: Number of lines and optional filter
 
     Returns:
-        Arm and gripper state information
+        Recent log entries
     """
-    status = _load_status()
+    log_file = LOGS_DIR / "controller.log"
 
-    if "error" in status:
-        return f"Error: {status['error']}"
+    if not log_file.exists():
+        return "No log file found."
 
-    arm = status.get("arm", {})
-    gripper = status.get("gripper", {})
+    try:
+        with open(log_file, 'r') as f:
+            all_lines = f.readlines()
+    except Exception as e:
+        return f"Error reading logs: {e}"
 
-    if params.response_format == ResponseFormat.JSON:
-        return json.dumps({"arm": arm, "gripper": gripper}, indent=2)
+    if params.filter_text:
+        all_lines = [ln for ln in all_lines if params.filter_text.lower() in ln.lower()]
 
-    lines = ["# Arm & Gripper State", ""]
+    lines = all_lines[-params.lines:]
 
-    # Gripper
-    gripper_state = gripper.get("state", "unknown")
-    gripper_icon = "✊" if gripper_state == "closed" else "🖐️"
-    lines.append(f"**Gripper**: {gripper_icon} {gripper_state}")
+    if not lines:
+        return "No matching log entries."
 
-    has_cube = gripper.get("has_cube", False)
-    if has_cube:
-        cube_color = gripper.get("cube_color", "unknown")
-        color_emoji = {"red": "🔴", "green": "🟢", "blue": "🔵"}.get(cube_color, "⚪")
-        lines.append(f"**Holding**: {color_emoji} {cube_color} cube")
+    result = ["# Controller Logs", ""]
+    if params.filter_text:
+        result.append(f"*Filter: '{params.filter_text}'*")
+    result.append(f"*Showing {len(lines)} entries*")
+    result.append("")
+    result.append("```")
+    result.extend([ln.rstrip() for ln in lines])
+    result.append("```")
 
-    # Arm joints
-    if arm:
+    return "\n".join(result)
+
+
+@mcp.tool(
+    name="webots_monitor",
+    annotations={
+        "title": "Monitor Simulation",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def webots_monitor(params: MonitorInput) -> str:
+    """
+    Monitor simulation for specified duration and report behavior.
+
+    Collects state snapshots over time to analyze robot behavior.
+
+    Args:
+        params: Duration to monitor (seconds)
+
+    Returns:
+        Analysis of robot behavior over time
+    """
+    import asyncio
+
+    snapshots: List[Dict[str, Any]] = []
+    interval = 2  # seconds between snapshots
+    num_samples = params.duration // interval
+
+    for _ in range(num_samples):
+        data = _load_json(STATUS_FILE)
+        if "error" not in data:
+            data["sample_time"] = datetime.now().isoformat()
+            snapshots.append(data)
+        await asyncio.sleep(interval)
+
+    if not snapshots:
+        return "No data collected. Is the simulation running?"
+
+    # Analyze
+    lines = ["# Simulation Monitor Report", ""]
+    lines.append(f"**Duration**: {params.duration}s ({len(snapshots)} samples)")
+    lines.append("")
+
+    # Track mode changes
+    modes = [s.get("mode", s.get("robots", {}).get("main", {}).get("mode", "unknown")) for s in snapshots]
+    mode_changes = []
+    for i in range(1, len(modes)):
+        if modes[i] != modes[i-1]:
+            mode_changes.append(f"{modes[i-1]} → {modes[i]}")
+
+    lines.append("## Mode Transitions")
+    if mode_changes:
+        for change in mode_changes:
+            lines.append(f"- {change}")
+    else:
+        lines.append(f"- Stayed in `{modes[0]}` mode")
+    lines.append("")
+
+    # Track position
+    positions = []
+    for s in snapshots:
+        pose = s.get("pose", s.get("robots", {}).get("main", {}).get("pose", []))
+        if pose and len(pose) >= 2:
+            positions.append((pose[0], pose[1]))
+
+    if positions:
+        import math
+        total_dist = 0
+        for i in range(1, len(positions)):
+            dx = positions[i][0] - positions[i-1][0]
+            dy = positions[i][1] - positions[i-1][1]
+            total_dist += math.sqrt(dx*dx + dy*dy)
+
+        lines.append("## Movement")
+        lines.append(f"- **Start**: ({positions[0][0]:.2f}, {positions[0][1]:.2f})")
+        lines.append(f"- **End**: ({positions[-1][0]:.2f}, {positions[-1][1]:.2f})")
+        lines.append(f"- **Distance**: {total_dist:.2f}m")
         lines.append("")
-        lines.append("## Arm Joints:")
-        for joint, value in arm.items():
-            lines.append(f"- {joint}: {value:.2f}°")
+
+    # Track collected (if present)
+    collected_vals = [s.get("collected", 0) for s in snapshots]
+    if any(collected_vals):
+        lines.append("## Progress")
+        lines.append(f"- **Collected**: {collected_vals[0]} → {collected_vals[-1]}")
+
+        delivered = snapshots[-1].get("delivered", {})
+        if delivered:
+            for color, count in delivered.items():
+                lines.append(f"- **{color}**: {count}")
 
     return "\n".join(lines)
 
@@ -808,7 +574,7 @@ async def webots_get_arm_state(params: ResponseFormatInput) -> str:
 @mcp.tool(
     name="webots_get_full_state",
     annotations={
-        "title": "Get Full Robot State",
+        "title": "Get Full State",
         "readOnlyHint": True,
         "destructiveHint": False,
         "idempotentHint": True,
@@ -817,31 +583,24 @@ async def webots_get_arm_state(params: ResponseFormatInput) -> str:
 )
 async def webots_get_full_state(params: EmptyInput) -> str:
     """
-    Get complete robot state snapshot for debugging.
+    Get complete simulation state as JSON for debugging.
 
-    Returns ALL available data: pose, sensors, task progress, arm state,
-    and navigation info in a single comprehensive view.
+    Returns all available data from status.json.
 
     Returns:
-        Complete robot state as JSON
-
-    Example:
-        - Use when: "Give me everything about the robot"
-        - Use when: "Full debug info please"
+        Complete state dump
     """
-    status = _load_status()
+    data = _load_json(STATUS_FILE)
 
-    if "error" in status:
-        return f"Error: {status['error']}"
+    if "error" in data:
+        return f"Error: {data['error']}"
 
-    result = json.dumps(status, indent=2)
-
+    result = json.dumps(data, indent=2)
     if len(result) > CHARACTER_LIMIT:
-        return f"Status data truncated (too large):\n\n{result[:CHARACTER_LIMIT]}\n\n... [truncated]"
+        return f"```json\n{result[:CHARACTER_LIMIT]}\n```\n\n... [truncated]"
 
-    return f"# Full Robot State\n\n```json\n{result}\n```"
+    return f"# Full State\n\n```json\n{result}\n```"
 
 
-# Run the server
 if __name__ == "__main__":
     mcp.run()
