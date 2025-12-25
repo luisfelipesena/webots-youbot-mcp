@@ -140,6 +140,10 @@ class MCPBridge:
             return None
         self._last_cmd_ts = ts
 
+        # CRITICAL: Clear the command file BEFORE processing to prevent reload loops
+        # When worldReload() is called, the controller restarts and would re-read the same command
+        self._clear_command_file()
+
         # Handle built-in commands
         action = cmd.get("action")
         if action == "simulation":
@@ -191,6 +195,14 @@ class MCPBridge:
 
         self._sim_time = current
         return False
+
+    def _clear_command_file(self):
+        """Clear the command file to prevent reload loops."""
+        try:
+            with open(self.commands_file, 'w') as f:
+                json.dump({"action": "none", "command": "cleared", "timestamp": "0"}, f)
+        except Exception:
+            pass
 
     def _handle_simulation_cmd(self, cmd: Dict[str, Any]):
         """Handle simulation control commands."""

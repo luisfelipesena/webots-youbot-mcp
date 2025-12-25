@@ -1,23 +1,23 @@
 {
   "pose": [
-    0.3949422328720465,
-    -0.6349334774696528,
-    -0.9999596414549697
+    -0.6889083766516031,
+    0.7866494574331098,
+    1.57357653561673
   ],
-  "mode": "return_to_spawn",
-  "collected": 1,
+  "mode": "to_box",
+  "collected": 2,
   "max_cubes": 15,
   "delivered": {
     "red": 0,
-    "green": 0,
-    "blue": 1
+    "green": 1,
+    "blue": 0
   },
-  "current_target": null,
+  "current_target": "blue",
   "lidar": {
-    "front": 0.44981661438941956,
-    "rear": 1.488135814666748,
-    "left": 1.4722380638122559,
-    "right": 1.586935043334961
+    "front": 0.9391592741012573,
+    "rear": 1.096077561378479,
+    "left": 1.5736514329910278,
+    "right": 2.309387445449829
   },
   "distance_sensors": {
     "front": 1.0,
@@ -25,12 +25,12 @@
     "front_right": 1.0
   },
   "gripper": {
-    "left": 0.025001181171241792,
-    "right": 0.025001182732918122,
-    "closed": false,
+    "left": 0.000522355106404112,
+    "right": 0.004477225299784557,
+    "closed": true,
     "has_cube": false
   },
   "recognition": null,
   "arm_state": "unknown",
-  "timestamp": "2025-12-13T22:31:25.936026"
+  "timestamp": "2025-12-21T19:13:31.771149"
 }
